@@ -20,6 +20,8 @@ const ENVIRONMENT_NAMES = [
   "PASEO_BOOTSTRAP_ORGANIZATION",
   "PASEO_BOOTSTRAP_OWNER_EMAIL",
   "PASEO_BOOTSTRAP_OWNER_PASSWORD",
+  "PASEO_HUB_GOOGLE_CLIENT_ID",
+  "PASEO_HUB_GOOGLE_CLIENT_SECRET",
 ] as const;
 
 const APP_URL = "http://localhost:3000";
@@ -41,6 +43,8 @@ beforeEach(async () => {
   process.env["PASEO_BOOTSTRAP_ORGANIZATION"] = "Embedded owner";
   process.env["PASEO_BOOTSTRAP_OWNER_EMAIL"] = "owner@embedded.test";
   process.env["PASEO_BOOTSTRAP_OWNER_PASSWORD"] = "embedded-owner-password";
+  delete process.env["PASEO_HUB_GOOGLE_CLIENT_ID"];
+  delete process.env["PASEO_HUB_GOOGLE_CLIENT_SECRET"];
 });
 
 afterEach(async () => {
@@ -129,6 +133,29 @@ it("releases embedded storage when runtime configuration is invalid", async () =
   await assert.rejects(() => startProductionRuntime(), TypeError);
 
   await reopenEmbeddedStorage();
+});
+
+it("refuses to start with half a Google OAuth client", async () => {
+  process.env["PASEO_HUB_GOOGLE_CLIENT_ID"] = "123.apps.googleusercontent.com";
+
+  await assert.rejects(
+    () => startProductionRuntime(),
+    /PASEO_HUB_GOOGLE_CLIENT_SECRET is required when PASEO_HUB_GOOGLE_CLIENT_ID is set/u,
+  );
+});
+
+it("offers Google sign-in when the Google OAuth client is configured", async () => {
+  process.env["PASEO_HUB_GOOGLE_CLIENT_ID"] = "123.apps.googleusercontent.com";
+  process.env["PASEO_HUB_GOOGLE_CLIENT_SECRET"] = "GOCSPX-secret";
+
+  const runtime = await startProductionRuntime();
+  const state = await runtime.browserAccount!(new Request(`${APP_URL}/api/auth/paseo/state`));
+
+  assert.deepEqual(await state.json(), {
+    status: "signedOut",
+    registration: "invite_only",
+    googleSignIn: true,
+  });
 });
 
 it("releases embedded storage when auth initialization fails", async () => {

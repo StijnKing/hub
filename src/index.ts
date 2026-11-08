@@ -30,6 +30,7 @@ import {
 } from "./billing/index.js";
 import { composeEntitlements, type ComposedEntitlements } from "./auth/entitlements.js";
 import { readInstanceAuthPolicy } from "./auth/instance-policy.js";
+import { readGoogleSignInConfig, type GoogleSignInConfig } from "./auth/google-sign-in.js";
 import { createRuntimeConfiguration } from "./runtime-configuration/index.js";
 import { CompositionResources } from "./composition-resources.js";
 import {
@@ -74,6 +75,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
   const resources = new CompositionResources();
   try {
     const config = loadRuntimeConfig();
+    const google = readGoogleSignInConfig();
     const { database, runtime, locks } = await createDatabaseHandle();
     resources.own(() => database.close());
     const migration = await migrateLegacyProjectTriggers(database);
@@ -118,6 +120,7 @@ async function createProductionRuntime(): Promise<ApplicationRuntime> {
       billing,
       invitationMailer,
       accountMailer,
+      google,
     );
     resources.own(() => auth.close());
     await auth.initialize?.();
@@ -195,6 +198,7 @@ function createProductionAuthServer(
   billing: BillingRuntime | null,
   invitationMailer: ReturnType<typeof createInvitationMailer> | undefined,
   accountMailer: ReturnType<typeof createAccountMailer> | undefined,
+  google: GoogleSignInConfig | undefined,
 ) {
   return createAuthServer({
     database,
@@ -206,6 +210,7 @@ function createProductionAuthServer(
     ...(trustedClientIpHeader === undefined ? {} : { trustedClientIpHeader }),
     ...(invitationMailer === undefined ? {} : { invitationMailer }),
     ...(accountMailer === undefined ? {} : { accountMailer }),
+    ...(google === undefined ? {} : { google }),
     // Hosted: new organizations are stamped with the Free plan and stay on it until someone buys
     // a plan. Self-hosted keeps the unlimited default and never touches Stripe.
     ...(billing === null
