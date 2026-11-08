@@ -1,4 +1,5 @@
 import { betterAuth } from "better-auth";
+import { APIError, getOAuthState } from "better-auth/api";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { tanstackStartCookies } from "better-auth/tanstack-start";
 import { z } from "zod";
@@ -39,6 +40,7 @@ import { InstanceAppOnboarding } from "../instance-setup/app-onboarding.js";
 import { TRUSTED_REQUEST_ORIGIN_HEADER } from "../http/request-origin.js";
 import type { InvitationMailer } from "../invitations/index.js";
 import type { AccountMailer } from "./account-emails.js";
+import type { GoogleSignInConfig } from "./google-sign-in.js";
 
 export interface AuthServer {
   handle(request: Request): Promise<Response>;
@@ -98,6 +100,8 @@ export interface AuthServerOptions {
   invitationMailer?: InvitationMailer;
   /** Optional account email delivery. Configured public instances require verification. */
   accountMailer?: AccountMailer;
+  /** Optional Google OAuth client. Without it Hub exposes no Google sign-in surface. */
+  google?: GoogleSignInConfig;
 }
 
 const sessionSchema = z.object({
@@ -128,6 +132,12 @@ const RAW_PRODUCT_PATHS = new Set([
   "/api/auth/verify-email",
 ]);
 
+const GOOGLE_SIGN_IN_PATH = "/api/auth/sign-in/google";
+const GOOGLE_CALLBACK_PATH = "/api/auth/callback/google";
+const googleSignInState = z.object({ invitation: z.string().min(1).optional() });
+const googleSignInBody = googleSignInState.strict();
+const googleAuthorization = z.object({ url: z.string().url() });
+
 export function createAuthServer(options: AuthServerOptions): AuthServer {
   const database = options.database.drizzle();
   const policy = options.policy ?? defaultInstanceAuthPolicy();
@@ -144,6 +154,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
   });
   const appOnboarding = new InstanceAppOnboarding(options.database);
   const accountMailer = options.accountMailer;
+  const google = options.google;
   const authSchema = {
     user: schema.users,
     session: schema.sessions,
@@ -204,6 +215,29 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
         },
       },
     },
+    ...(google === undefined
+      ? {}
+      : {
+          socialProviders: {
+            google: {
+              clientId: google.clientId,
+              clientSecret: google.clientSecret,
+              disableIdTokenSignIn: true,
+            },
+          },
+          account: {
+            encryptOAuthTokens: true,
+            accountLinking: {
+              enabled: true,
+              trustedProviders: [],
+              requireLocalEmailVerified: true,
+            },
+          },
+          onAPIError: { errorURL: googleSignInCallback(options.baseURL, undefined, true) },
+          databaseHooks: {
+            user: { create: { before: (user, context) => admitGoogleUser(user, context?.path) } },
+          },
+        }),
     plugins: [paseoOrganizationPlugin(), tanstackStartCookies()],
   });
   const sessions = {
@@ -240,6 +274,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     ...(options.invitationMailer === undefined
       ? {}
       : { invitationMailer: options.invitationMailer }),
+    googleSignIn: google !== undefined,
   });
   const browserOrigin = new URL(options.baseURL).origin;
 
@@ -272,6 +307,8 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
         if (rejected !== undefined) return Promise.resolve(rejected);
         return changePassword(request);
       }
+      const googleResponse = google === undefined ? undefined : handleGoogle(request, path);
+      if (googleResponse !== undefined) return googleResponse;
       if (!RAW_PRODUCT_PATHS.has(path) && !path.startsWith("/api/auth/reset-password/")) {
         return Promise.resolve(Response.json({ error: "not_found" }, { status: 404 }));
       }
@@ -382,6 +419,67 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     close: () => Promise.resolve(),
   };
 
+  function handleGoogle(request: Request, path: string): Promise<Response> | undefined {
+    if (path === GOOGLE_SIGN_IN_PATH && request.method === "POST") {
+      return beginGoogleSignIn(request);
+    }
+    if (path === GOOGLE_CALLBACK_PATH && request.method === "GET") return auth.handler(request);
+    return undefined;
+  }
+
+  async function beginGoogleSignIn(request: Request): Promise<Response> {
+    const rejected = rejectForeignOrigin(request, requestBrowserOrigin(request, browserOrigin));
+    if (rejected !== undefined) return rejected;
+    const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+    const body =
+      contentType === "application/x-www-form-urlencoded"
+        ? googleSignInBody.safeParse(Object.fromEntries(new URLSearchParams(await request.text())))
+        : undefined;
+    if (body === undefined || !body.success) {
+      return Response.json({ error: "invalid_google_sign_in" }, { status: 400 });
+    }
+    const invitationId = body.data.invitation;
+    const headers = new Headers(request.headers);
+    headers.set("content-type", "application/json");
+    headers.delete("content-length");
+    const response = await auth.handler(
+      new Request(new URL("/api/auth/sign-in/social", request.url), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          provider: "google",
+          callbackURL: googleSignInCallback(options.baseURL, invitationId),
+          errorCallbackURL: googleSignInCallback(options.baseURL, invitationId, true),
+          disableRedirect: true,
+          ...(invitationId === undefined ? {} : { additionalData: { invitation: invitationId } }),
+        }),
+      }),
+    );
+    if (!response.ok) return response;
+    const { url } = googleAuthorization.parse(await response.json());
+    const redirect = new Headers({ location: url });
+    for (const cookie of response.headers.getSetCookie()) redirect.append("set-cookie", cookie);
+    return new Response(null, { status: 303, headers: redirect });
+  }
+
+  async function admitGoogleUser(
+    user: { email: string; emailVerified: boolean },
+    endpoint: string | undefined,
+  ): Promise<void> {
+    if (endpoint === "/sign-up/email") return;
+    if (!user.emailVerified) throw new APIError("FORBIDDEN", { message: "email_not_verified" });
+    const state = googleSignInState.safeParse(await getOAuthState());
+    const invitation = state.success ? state.data.invitation : undefined;
+    try {
+      await registration.withAdmission(user.email, invitation, () => Promise.resolve());
+    } catch (error) {
+      if (error instanceof RegistrationAdmissionError) {
+        throw new APIError("FORBIDDEN", { message: "registration_closed", cause: error });
+      }
+      throw error;
+    }
+  }
+
   async function changePassword(request: Request): Promise<Response> {
     const session = await sessions.read(request.headers);
     const body = await request
@@ -416,6 +514,13 @@ function accountCallback(baseURL: string, invitationId?: string): string {
   const callback = new URL("/", baseURL);
   callback.searchParams.set("auth", "email-verification");
   if (invitationId !== undefined) callback.searchParams.set("invitation", invitationId);
+  return callback.toString();
+}
+
+function googleSignInCallback(baseURL: string, invitationId?: string, failed = false): string {
+  const callback = new URL("/", baseURL);
+  if (invitationId !== undefined) callback.searchParams.set("invitation", invitationId);
+  if (failed) callback.searchParams.set("auth", "google-sign-in");
   return callback.toString();
 }
 
@@ -458,6 +563,10 @@ function rejectCrossOriginCookieMutation(
   browserOrigin: string,
 ): Response | undefined {
   if (request.method !== "POST" || !request.headers.has("cookie")) return undefined;
+  return rejectForeignOrigin(request, browserOrigin);
+}
+
+function rejectForeignOrigin(request: Request, browserOrigin: string): Response | undefined {
   if (request.headers.get("sec-fetch-site") === "cross-site") {
     return authBoundaryError(
       "Cross-site navigation login blocked. This request appears to be a CSRF attack.",

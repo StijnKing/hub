@@ -107,6 +107,8 @@ interface OrganizationAccessOptions {
   onMembershipChanged?: (organizationId: string) => Promise<void>;
   /** Optional post-commit invitation delivery. Never rolls back or fails a created invitation. */
   invitationMailer?: InvitationMailer;
+  /** Whether the signed-out entry offers Google sign-in. */
+  googleSignIn?: boolean;
 }
 
 interface MembershipRow extends QueryRow {
@@ -247,6 +249,7 @@ export class OrganizationAccess {
       return Response.json({
         status: "signedOut",
         registration: this.options.policy.registrationMode,
+        ...(this.options.googleSignIn === true ? { googleSignIn: true } : {}),
         ...(invitation === undefined ? {} : { invitation: invitationSummary(invitation, true) }),
         ...(invitationId !== null && invitation === undefined
           ? { invitationUnavailable: true }
