@@ -26,6 +26,11 @@ import type { AccountState } from "./organization-contract.js";
 import type { Result } from "../contract/respond.js";
 import { ACCOUNT_MUTATION_KEY, useAccountMutationError } from "./account-mutation.js";
 import { ForgotPasswordEntry, VerificationPendingEntry } from "./account-recovery.js";
+import {
+  GoogleSignInForm,
+  leaveGoogleSignInError,
+  readGoogleSignInError,
+} from "./google-sign-in-form.js";
 
 type EmptyResult = Result<Record<string, never>>;
 type AuthenticationResult = Result<{ state: "complete" | "verificationRequired" }>;
@@ -46,6 +51,10 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
   const [mode, setMode] = useState<"signIn" | "signUp">(invitationContext ? "signUp" : "signIn");
   const [forgotPassword, setForgotPassword] = useState(false);
   const [verificationEmail, setVerificationEmail] = useState<string>();
+  const [googleError] = useState(readGoogleSignInError);
+  useEffect(() => {
+    if (googleError !== undefined) leaveGoogleSignInError();
+  }, [googleError]);
   useEffect(() => {
     if (invitationContext && invitationId !== undefined) {
       setMode(invitationSignInRequested ? "signIn" : "signUp");
@@ -125,7 +134,7 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
             ? "Hub did not receive the sign-in result. Check your connection and submit again."
             : "Hub did not receive the account-creation result. Check your connection and invitation before submitting again.",
         )
-      : undefined;
+      : googleError;
   const { title, description } = accountEntryPresentation(account, mode, invitationSignup);
 
   if (forgotPassword) return <ForgotPasswordEntry onBack={showSignIn} />;
@@ -156,6 +165,12 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
             : { emailValue: account.invitation.email })}
           {...(invitationContext ? { emailReadOnly: true } : {})}
         />
+        {account.googleSignIn === true && (
+          <GoogleSignInForm
+            busy={busy}
+            {...(invitationId === undefined ? {} : { invitation: invitationId })}
+          />
+        )}
         <SignedOutFooter
           registration={account.registration}
           invitationContext={invitationContext}
