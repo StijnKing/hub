@@ -51,10 +51,7 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
   const [mode, setMode] = useState<"signIn" | "signUp">(invitationContext ? "signUp" : "signIn");
   const [forgotPassword, setForgotPassword] = useState(false);
   const [verificationEmail, setVerificationEmail] = useState<string>();
-  const [googleError] = useState(readGoogleSignInError);
-  useEffect(() => {
-    if (googleError !== undefined) leaveGoogleSignInError();
-  }, [googleError]);
+  const googleError = useGoogleSignInError(true);
   useEffect(() => {
     if (invitationContext && invitationId !== undefined) {
       setMode(invitationSignInRequested ? "signIn" : "signUp");
@@ -182,6 +179,60 @@ export function AccountEntry({ account }: { account: AccountState & { status: "s
       </AuthCard>
     </AuthLayout>
   );
+}
+
+/**
+ * The signed-out card when password sign-in is disabled: Google is the only way in, so there is
+ * no form, no mode toggle, and no password recovery to offer.
+ */
+export function GoogleOnlyEntry({ account }: { account: AccountState & { status: "signedOut" } }) {
+  const googleError = useGoogleSignInError(false);
+  const invitation = account.invitation;
+  const { title, description } = accountEntryPresentation(
+    account,
+    "signIn",
+    invitation !== undefined,
+  );
+  const note = googleOnlyNote(account);
+  return (
+    <AuthLayout>
+      <AuthCard titleId="account-entry-heading" title={title} description={description}>
+        <p role="status" className="sr-only">
+          Signed out
+        </p>
+        <ErrorSummary message={googleError} />
+        <GoogleSignInForm
+          busy={false}
+          primary
+          {...(invitation === undefined ? {} : { invitation: invitation.id })}
+        />
+        {note === undefined ? null : (
+          <p className="text-center text-sm text-muted-foreground">{note}</p>
+        )}
+      </AuthCard>
+    </AuthLayout>
+  );
+}
+
+function googleOnlyNote(account: AccountState & { status: "signedOut" }): string | undefined {
+  if (account.invitation !== undefined) {
+    return account.invitation.email === undefined
+      ? "Continue with the Google account this invitation was sent to."
+      : `Continue with the Google account for ${account.invitation.email}.`;
+  }
+  if (account.registration === "invite_only") {
+    return "Accounts are created by invitation. Ask an organization owner to invite you.";
+  }
+  if (account.registration === "disabled") return "Paseo Hub isn't accepting new accounts.";
+  return undefined;
+}
+
+function useGoogleSignInError(passwordSignIn: boolean): string | undefined {
+  const [googleError] = useState(() => readGoogleSignInError(passwordSignIn));
+  useEffect(() => {
+    if (googleError !== undefined) leaveGoogleSignInError();
+  }, [googleError]);
+  return googleError;
 }
 
 function accountEntryPresentation(

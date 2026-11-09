@@ -3,7 +3,12 @@ import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useState } from "react";
 import { accountState } from "./functions.js";
 import { DaemonHandoffEntry } from "../daemons/handoff.js";
-import { AccountEntry, InvitationEntry, OrganizationGate } from "./account-entry.js";
+import {
+  AccountEntry,
+  GoogleOnlyEntry,
+  InvitationEntry,
+  OrganizationGate,
+} from "./account-entry.js";
 import { FailedEntry, LoadingEntry, UnavailableInvitation } from "./account-states.js";
 import { DashboardShell } from "../shell/dashboard-shell.js";
 import { InstanceSetupEntry } from "./instance-setup-entry.js";
@@ -65,7 +70,13 @@ function AccountApplication() {
   if (state.invitationUnavailable === true) {
     return <UnavailableInvitation message="This invitation is unavailable." />;
   }
-  if (state.status === "signedOut") return <AccountEntry account={state} />;
+  if (state.status === "signedOut") {
+    return state.passwordSignInDisabled === true ? (
+      <GoogleOnlyEntry account={state} />
+    ) : (
+      <AccountEntry account={state} />
+    );
+  }
   if (state.invitation !== undefined) {
     return <InvitationEntry account={state} invitation={state.invitation} />;
   }

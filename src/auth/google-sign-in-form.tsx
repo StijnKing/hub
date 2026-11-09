@@ -7,8 +7,6 @@ const GOOGLE_SIGN_IN_ERRORS: Record<string, string> = {
     "Hub has no account for this Google email address and isn't accepting it as a new one. Ask an organization owner to invite that address.",
   email_not_verified:
     "Google hasn't verified this account's email address, so Hub can't sign you in with it.",
-  account_not_linked:
-    "Hub couldn't link this Google account to the existing account with the same email. Sign in with your password instead.",
   access_denied: "Google sign-in was canceled.",
 };
 
@@ -16,14 +14,22 @@ const GOOGLE_SIGN_IN_ERRORS: Record<string, string> = {
  * A plain form post, not a server function: Hub answers with a redirect to Google, and the
  * browser has to follow it as a navigation for Google's consent screen to load.
  */
-export function GoogleSignInForm({ invitation, busy }: { invitation?: string; busy: boolean }) {
+export function GoogleSignInForm({
+  invitation,
+  busy,
+  primary = false,
+}: {
+  invitation?: string;
+  busy: boolean;
+  primary?: boolean;
+}) {
   return (
     <form method="post" action="/api/auth/sign-in/google" aria-label="Continue with Google">
       {invitation === undefined ? null : (
         <Input type="hidden" name="invitation" value={invitation} />
       )}
       <AuthActions>
-        <Button type="submit" size="lg" variant="outline" disabled={busy}>
+        <Button type="submit" size="lg" variant={primary ? "default" : "outline"} disabled={busy}>
           Continue with Google
         </Button>
       </AuthActions>
@@ -31,11 +37,16 @@ export function GoogleSignInForm({ invitation, busy }: { invitation?: string; bu
   );
 }
 
-export function readGoogleSignInError(): string | undefined {
+export function readGoogleSignInError(passwordSignIn: boolean): string | undefined {
   if (typeof window === "undefined") return undefined;
   const search = new URLSearchParams(window.location.search);
   if (search.get("auth") !== "google-sign-in") return undefined;
   const error = search.get("error") ?? "";
+  if (error === "account_not_linked") {
+    return passwordSignIn
+      ? "Hub couldn't link this Google account to the existing account with the same email. Sign in with your password instead."
+      : "Hub couldn't link this Google account to the existing account with the same email because that email isn't verified. Ask an operator of this Hub to verify it.";
+  }
   return GOOGLE_SIGN_IN_ERRORS[error] ?? "Google sign-in didn't complete. Try again.";
 }
 
