@@ -98,8 +98,9 @@ configuration, managers retain the existing copy-and-share invitation workflow.
 Google sign-in is optional as well: set `PASEO_HUB_GOOGLE_CLIENT_ID` and
 `PASEO_HUB_GOOGLE_CLIENT_SECRET` from a Google OAuth client of type Web application whose
 redirect URI is `https://hub.example.com/api/auth/callback/google`. New Google accounts follow
-`PASEO_REGISTRATION_MODE` and invitations like password accounts do. See
-[docs/google-sign-in.md](docs/google-sign-in.md).
+`PASEO_REGISTRATION_MODE` and invitations like password accounts do. Set
+`PASEO_HUB_PASSWORD_SIGN_IN=disabled` as well to make Google the only way to sign in; the bootstrap
+owner then needs no password. See [docs/google-sign-in.md](docs/google-sign-in.md).
 
 Then start Hub and PostgreSQL:
 
