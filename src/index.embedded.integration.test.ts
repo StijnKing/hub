@@ -22,6 +22,7 @@ const ENVIRONMENT_NAMES = [
   "PASEO_BOOTSTRAP_OWNER_PASSWORD",
   "PASEO_HUB_GOOGLE_CLIENT_ID",
   "PASEO_HUB_GOOGLE_CLIENT_SECRET",
+  "PASEO_HUB_PASSWORD_SIGN_IN",
 ] as const;
 
 const APP_URL = "http://localhost:3000";
@@ -45,6 +46,7 @@ beforeEach(async () => {
   process.env["PASEO_BOOTSTRAP_OWNER_PASSWORD"] = "embedded-owner-password";
   delete process.env["PASEO_HUB_GOOGLE_CLIENT_ID"];
   delete process.env["PASEO_HUB_GOOGLE_CLIENT_SECRET"];
+  delete process.env["PASEO_HUB_PASSWORD_SIGN_IN"];
 });
 
 afterEach(async () => {
@@ -156,6 +158,66 @@ it("offers Google sign-in when the Google OAuth client is configured", async () 
     registration: "invite_only",
     googleSignIn: true,
   });
+});
+
+it("refuses to start with an unknown password sign-in mode", async () => {
+  process.env["PASEO_HUB_PASSWORD_SIGN_IN"] = "off";
+
+  await assert.rejects(
+    () => startProductionRuntime(),
+    /PASEO_HUB_PASSWORD_SIGN_IN must be one of: enabled, disabled/u,
+  );
+});
+
+it("refuses to turn password sign-in off without a Google OAuth client", async () => {
+  process.env["PASEO_HUB_PASSWORD_SIGN_IN"] = "disabled";
+  delete process.env["PASEO_BOOTSTRAP_OWNER_PASSWORD"];
+
+  await assert.rejects(
+    () => startProductionRuntime(),
+    /PASEO_HUB_PASSWORD_SIGN_IN=disabled requires PASEO_HUB_GOOGLE_CLIENT_ID and PASEO_HUB_GOOGLE_CLIENT_SECRET/u,
+  );
+  await reopenEmbeddedStorage();
+});
+
+it("starts Google-only with a bootstrap owner and no password", async () => {
+  process.env["PASEO_HUB_PASSWORD_SIGN_IN"] = "disabled";
+  process.env["PASEO_HUB_GOOGLE_CLIENT_ID"] = "123.apps.googleusercontent.com";
+  process.env["PASEO_HUB_GOOGLE_CLIENT_SECRET"] = "GOCSPX-secret";
+  delete process.env["PASEO_BOOTSTRAP_OWNER_PASSWORD"];
+
+  const runtime = await startProductionRuntime();
+  const state = await runtime.browserAccount!(new Request(`${APP_URL}/api/auth/paseo/state`));
+
+  assert.deepEqual(await state.json(), {
+    status: "signedOut",
+    registration: "invite_only",
+    googleSignIn: true,
+    passwordSignInDisabled: true,
+  });
+  const signIn = await runtime.auth(
+    new Request(`${APP_URL}/api/auth/sign-in/email`, {
+      method: "POST",
+      headers: { origin: APP_URL, "content-type": "application/json" },
+      body: JSON.stringify({ email: "owner@embedded.test", password: "embedded-owner-password" }),
+    }),
+  );
+  assert.equal(signIn.status, 404);
+});
+
+it("refuses to start a pristine Google-only instance without a bootstrap owner", async () => {
+  process.env["PASEO_HUB_PASSWORD_SIGN_IN"] = "disabled";
+  process.env["PASEO_HUB_GOOGLE_CLIENT_ID"] = "123.apps.googleusercontent.com";
+  process.env["PASEO_HUB_GOOGLE_CLIENT_SECRET"] = "GOCSPX-secret";
+  delete process.env["PASEO_BOOTSTRAP_ORGANIZATION"];
+  delete process.env["PASEO_BOOTSTRAP_OWNER_EMAIL"];
+  delete process.env["PASEO_BOOTSTRAP_OWNER_PASSWORD"];
+
+  await assert.rejects(
+    () => startProductionRuntime(),
+    /PASEO_BOOTSTRAP_ORGANIZATION and PASEO_BOOTSTRAP_OWNER_EMAIL are required/u,
+  );
+  await reopenEmbeddedStorage();
 });
 
 it("releases embedded storage when auth initialization fails", async () => {

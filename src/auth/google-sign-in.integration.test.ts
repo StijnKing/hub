@@ -9,7 +9,7 @@ import {
   testDatabaseLocks,
   testDatabaseRuntime,
 } from "../db/test-utils/runtime.js";
-import type { RegistrationMode } from "./instance-policy.js";
+import type { BootstrapSettings, PasswordSignInMode, RegistrationMode } from "./instance-policy.js";
 import { accountStateSchema, type AccountState } from "./organization-contract.js";
 import { createAuthServer, type AuthServer } from "./server.js";
 import { composeEntitlements } from "./entitlements.js";
@@ -227,25 +227,214 @@ describe("Google sign-in boundary", () => {
     assert.equal(await hub.userCount(), 2);
   });
 
-  async function startHub(registrationMode: RegistrationMode, google?: typeof GOOGLE) {
-    const url = new URL(postgres.getConnectionUri());
-    url.pathname = `/google_${randomUUID().replaceAll("-", "")}`;
+  it("refuses to turn password sign-in off without a Google client", async () => {
+    await assert.rejects(
+      () => startHub("invite_only", undefined, { passwordSignIn: "disabled" }),
+      /^Error: PASEO_HUB_PASSWORD_SIGN_IN=disabled requires PASEO_HUB_GOOGLE_CLIENT_ID and PASEO_HUB_GOOGLE_CLIENT_SECRET$/,
+    );
+  });
+
+  it("closes every password route and server function when password sign-in is off", async () => {
+    const hub = await startHub("open", GOOGLE, { passwordSignIn: "disabled" });
+    await hub.seedPasswordUser("existing@example.test", { emailVerified: true });
+    const state = await hub.state("");
+    assert.deepEqual(state, {
+      status: "signedOut",
+      registration: "open",
+      googleSignIn: true,
+      passwordSignInDisabled: true,
+    });
+    for (const path of [
+      "/api/auth/sign-in/email",
+      "/api/auth/sign-up/email",
+      "/api/auth/change-password",
+      "/api/auth/verify-email",
+      "/api/auth/request-password-reset",
+      "/api/auth/reset-password",
+      "/api/auth/reset-password/token",
+      "/api/auth/set-password",
+    ]) {
+      assert.equal((await hub.post(path, {})).status, 404, path);
+    }
+    const browserChange = await hub.auth.browserAccount!(
+      new Request(`${APP_URL}/api/auth/change-password`, {
+        method: "POST",
+        headers: { origin: APP_URL, "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+    assert.equal(browserChange.status, 404);
+    assert.equal(
+      (await hub.auth.handle(new Request(`${APP_URL}/api/auth/get-session`))).status,
+      200,
+    );
+    assert.equal((await hub.beginSignIn()).status, 303);
+
+    const headers = new Headers({ origin: APP_URL });
+    const credentials = { email: "existing@example.test", password: "long-password-123" };
+    const refusals: Array<[string, () => Promise<unknown>]> = [
+      ["signInEmail", () => hub.auth.signInEmail!(credentials, headers)],
+      ["signUpEmail", () => hub.auth.signUpEmail!({ ...credentials, name: "New" }, headers)],
+      ["sendVerificationEmail", () => hub.auth.sendVerificationEmail!(credentials.email, headers)],
+      ["requestPasswordReset", () => hub.auth.requestPasswordReset!(credentials.email, headers)],
+      [
+        "resetPassword",
+        () =>
+          hub.auth.resetPassword!({ token: "token", newPassword: "long-password-456" }, headers),
+      ],
+      [
+        "changePassword",
+        () =>
+          hub.auth.changePassword!(
+            { currentPassword: credentials.password, newPassword: "long-password-456" },
+            headers,
+          ),
+      ],
+      ["claimInstance", () => hub.auth.claimInstance!(credentials, headers)],
+    ];
+    for (const [name, refuse] of refusals) {
+      await assert.rejects(refuse, /^Error: password sign-in is disabled$/, name);
+    }
+    assert.equal(await hub.userCount(), 1);
+  });
+
+  it("suspends an existing password until password sign-in is turned back on", async () => {
+    const disabled = await startHub("invite_only", GOOGLE, { passwordSignIn: "disabled" });
+    const user = await disabled.seedPasswordUser("member@example.test", { emailVerified: true });
+    assert.equal((await disabled.passwordSignIn("member@example.test")).status, 404);
+    assert.deepEqual(await disabled.providers(user), ["credential"]);
+
+    const enabled = await startHub("invite_only", GOOGLE, { url: disabled.url });
+    assert.equal((await enabled.passwordSignIn("member@example.test")).status, 200);
+  });
+
+  it("does not hold a Google session at a password change when password sign-in is off", async () => {
+    const hub = await startHub("invite_only", GOOGLE, { passwordSignIn: "disabled" });
+    await hub.seedPasswordUser("temporary@example.test", {
+      emailVerified: true,
+      mustChangePassword: true,
+    });
+    const result = await hub.googleSignIn({
+      sub: "google-temporary",
+      email: "temporary@example.test",
+      emailVerified: true,
+      name: "Temporary",
+    });
+    assert.equal((await hub.state(result.cookie)).status, "organizationRequired");
+    const account = await hub.auth.resolveAccount(
+      new Request(`${APP_URL}/api/auth/paseo/state`, { headers: { cookie: result.cookie } }),
+    );
+    assert.equal(account.account.email, "temporary@example.test");
+  });
+
+  it("creates a password-less bootstrap owner who signs in with Google", async () => {
+    const bootstrap = {
+      organizationName: "Google Only",
+      ownerEmail: "owner@example.test",
+      ownerPassword: undefined,
+    };
+    const hub = await startHub("invite_only", GOOGLE, { passwordSignIn: "disabled", bootstrap });
+    await hub.auth.initialize!();
+    const owner = await hub.owner("owner@example.test");
+    assert.deepEqual(owner, { emailVerified: true, mustChangePassword: false });
+    const [ownerId] = await hub.userIds("owner@example.test");
+    assert.deepEqual(await hub.providers(ownerId!), []);
+
+    const result = await hub.googleSignIn({
+      sub: "google-owner",
+      email: "owner@example.test",
+      emailVerified: true,
+      name: "Owner",
+    });
+    const state = await hub.state(result.cookie);
+    assert.equal(state.status, "appSetupRequired");
+    assert.equal(state.organization.name, "Google Only");
+    assert.deepEqual(await hub.providers(ownerId!), ["google"]);
+  });
+
+  it("refuses to start a pristine Google-only instance without a bootstrap owner", async () => {
+    const hub = await startHub("invite_only", GOOGLE, { passwordSignIn: "disabled" });
+    await assert.rejects(
+      () => hub.auth.initialize!(),
+      /PASEO_BOOTSTRAP_ORGANIZATION and PASEO_BOOTSTRAP_OWNER_EMAIL are required to create the first owner when PASEO_HUB_PASSWORD_SIGN_IN is disabled/,
+    );
+    assert.equal((await hub.state("")).status, "signedOut");
+  });
+
+  it("restarts an instance bootstrapped with a password into Google-only sign-in", async () => {
+    const withPassword = await startHub("invite_only", undefined, {
+      bootstrap: {
+        organizationName: "Drieam",
+        ownerEmail: "owner@drieam.example",
+        ownerPassword: "temporary-owner-password",
+      },
+    });
+    await withPassword.auth.initialize!();
+    assert.deepEqual(await withPassword.owner("owner@drieam.example"), {
+      emailVerified: true,
+      mustChangePassword: true,
+    });
+
+    const googleOnly = await startHub("invite_only", GOOGLE, {
+      url: withPassword.url,
+      passwordSignIn: "disabled",
+      bootstrap: {
+        organizationName: "Drieam",
+        ownerEmail: "owner@drieam.example",
+        ownerPassword: undefined,
+      },
+    });
+    await googleOnly.auth.initialize!();
+    assert.equal(
+      (await googleOnly.passwordSignIn("owner@drieam.example", "temporary-owner-password")).status,
+      404,
+    );
+    const result = await googleOnly.googleSignIn({
+      sub: "google-drieam-owner",
+      email: "owner@drieam.example",
+      emailVerified: true,
+      name: "Owner",
+    });
+    const state = await googleOnly.state(result.cookie);
+    assert.equal(state.status, "appSetupRequired");
+    assert.equal(state.organization.name, "Drieam");
+    const [ownerId] = await googleOnly.userIds("owner@drieam.example");
+    assert.deepEqual(await googleOnly.providers(ownerId!), ["credential", "google"]);
+    assert.deepEqual(await googleOnly.userIds("owner@drieam.example"), [ownerId]);
+  });
+
+  async function startHub(
+    registrationMode: RegistrationMode,
+    google?: typeof GOOGLE,
+    options: {
+      url?: string;
+      passwordSignIn?: PasswordSignInMode;
+      bootstrap?: BootstrapSettings;
+    } = {},
+  ) {
+    const url = new URL(options.url ?? postgres.getConnectionUri());
+    if (options.url === undefined) url.pathname = `/google_${randomUUID().replaceAll("-", "")}`;
     const database = await createDatabase(url.toString());
     const entitlements = composeEntitlements(database, testDatabaseRuntime(database));
+    running.push(async () => {
+      await entitlements.close();
+      await database.close();
+    });
     const auth = createAuthServer({
       database: testDatabaseRuntime(database),
       locks: testDatabaseLocks(database),
       entitlements: entitlements.service,
       secret: "google-sign-in-secret-at-least-32-characters",
       baseURL: APP_URL,
-      policy: { registrationMode, organizationCreation: "disabled", bootstrap: undefined },
+      policy: {
+        registrationMode,
+        organizationCreation: "disabled",
+        bootstrap: options.bootstrap,
+        ...(options.passwordSignIn === undefined ? {} : { passwordSignIn: options.passwordSignIn }),
+      },
       ...(google === undefined ? {} : { google }),
     });
-    running.push(async () => {
-      await auth.close();
-      await entitlements.close();
-      await database.close();
-    });
+    running.push(() => auth.close());
     return new GoogleHub(auth, url.toString());
   }
 });
@@ -255,7 +444,7 @@ class GoogleHub {
 
   constructor(
     readonly auth: AuthServer,
-    private readonly url: string,
+    readonly url: string,
   ) {
     vi.stubGlobal("fetch", this.fetch(globalThis.fetch));
   }
@@ -299,14 +488,36 @@ class GoogleHub {
     };
   }
 
-  async passwordSignIn(email: string): Promise<Response> {
+  async passwordSignIn(email: string, password = "long-password-123"): Promise<Response> {
+    return this.post("/api/auth/sign-in/email", { email, password });
+  }
+
+  async post(path: string, body: unknown): Promise<Response> {
     return this.auth.handle(
-      new Request(`${APP_URL}/api/auth/sign-in/email`, {
+      new Request(`${APP_URL}${path}`, {
         method: "POST",
         headers: { origin: APP_URL, "content-type": "application/json" },
-        body: JSON.stringify({ email, password: "long-password-123" }),
+        body: JSON.stringify(body),
       }),
     );
+  }
+
+  async owner(email: string): Promise<{ emailVerified: boolean; mustChangePassword: boolean }> {
+    const rows = await this.query<{ email_verified: boolean; must_change_password: boolean }>(
+      `select email_verified, must_change_password from "user" where email = $1`,
+      [email],
+    );
+    return {
+      emailVerified: rows[0]!.email_verified,
+      mustChangePassword: rows[0]!.must_change_password,
+    };
+  }
+
+  async userIds(email: string): Promise<string[]> {
+    const rows = await this.query<{ id: string }>(`select id from "user" where email = $1`, [
+      email,
+    ]);
+    return rows.map((row) => row.id);
   }
 
   async state(cookie: string, invitation?: string): Promise<AccountState> {

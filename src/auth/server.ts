@@ -132,6 +132,8 @@ const RAW_PRODUCT_PATHS = new Set([
   "/api/auth/verify-email",
 ]);
 
+const PASSWORDLESS_PRODUCT_PATHS = new Set(["/api/auth/get-session", "/api/auth/sign-out"]);
+
 const GOOGLE_SIGN_IN_PATH = "/api/auth/sign-in/google";
 const GOOGLE_CALLBACK_PATH = "/api/auth/callback/google";
 const googleSignInState = z.object({ invitation: z.string().min(1).optional() });
@@ -155,6 +157,12 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
   const appOnboarding = new InstanceAppOnboarding(options.database);
   const accountMailer = options.accountMailer;
   const google = options.google;
+  const passwordSignIn = policy.passwordSignIn !== "disabled";
+  if (!passwordSignIn && google === undefined) {
+    throw new Error(
+      "PASEO_HUB_PASSWORD_SIGN_IN=disabled requires PASEO_HUB_GOOGLE_CLIENT_ID and PASEO_HUB_GOOGLE_CLIENT_SECRET",
+    );
+  }
   const authSchema = {
     user: schema.users,
     session: schema.sessions,
@@ -178,7 +186,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
         }),
     database: drizzleAdapter(database, { provider: "pg", schema: authSchema }),
     emailAndPassword: {
-      enabled: true,
+      enabled: passwordSignIn,
       minPasswordLength: PASSWORD_MIN_LENGTH,
       requireEmailVerification: accountMailer !== undefined,
       revokeSessionsOnPasswordReset: true,
@@ -251,7 +259,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
         name: parsed.data.user.name,
         email: parsed.data.user.email,
         activeOrganizationId: parsed.data.session.activeOrganizationId ?? null,
-        mustChangePassword: parsed.data.user.mustChangePassword ?? false,
+        mustChangePassword: passwordSignIn && (parsed.data.user.mustChangePassword ?? false),
         isInstanceOperator: parsed.data.user.isInstanceOperator ?? false,
       };
     },
@@ -289,6 +297,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
         if (rejected !== undefined) return Promise.resolve(rejected);
         return access.handle(request);
       }
+      if (!passwordSignIn) return handlePasswordless(request, path);
       if (path === "/api/auth/sign-up/email") {
         return registration
           .handleSignUp(request, (admittedRequest) => auth.handler(admittedRequest))
@@ -310,13 +319,14 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       const googleResponse = google === undefined ? undefined : handleGoogle(request, path);
       if (googleResponse !== undefined) return googleResponse;
       if (!RAW_PRODUCT_PATHS.has(path) && !path.startsWith("/api/auth/reset-password/")) {
-        return Promise.resolve(Response.json({ error: "not_found" }, { status: 404 }));
+        return Promise.resolve(notFound());
       }
       return auth.handler(request);
     },
     browserAccount: (request) => {
       const path = new URL(request.url).pathname;
       if (path === "/api/auth/change-password") {
+        if (!passwordSignIn) return Promise.resolve(notFound());
         const rejected = rejectCrossOriginCookieMutation(
           request,
           requestBrowserOrigin(request, browserOrigin),
@@ -326,6 +336,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       return access.handle(request);
     },
     async signInEmail(data, headers) {
+      requirePasswordSignIn();
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       await auth.api.signInEmail({
         body: {
@@ -338,6 +349,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       return "complete";
     },
     async signUpEmail(data, headers, invitationId) {
+      requirePasswordSignIn();
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       await registration.withAdmission(data.email, invitationId, async () => {
         await auth.api.signUpEmail({
@@ -348,6 +360,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       return accountMailer === undefined ? "complete" : "verificationRequired";
     },
     async sendVerificationEmail(email, headers, invitationId) {
+      requirePasswordSignIn();
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       await auth.api.sendVerificationEmail({
         body: { email, callbackURL: accountCallback(options.baseURL, invitationId) },
@@ -355,6 +368,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       });
     },
     async requestPasswordReset(email, headers) {
+      requirePasswordSignIn();
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       await auth.api.requestPasswordReset({
         body: { email, redirectTo: passwordResetCallback(options.baseURL) },
@@ -362,10 +376,12 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       });
     },
     async resetPassword(data, headers) {
+      requirePasswordSignIn();
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       await auth.api.resetPassword({ body: data, headers });
     },
     async claimInstance(operator, headers) {
+      requirePasswordSignIn();
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       const claim = await instanceSetup.claim(operator);
       if (claim.status !== "claimed") return claim;
@@ -393,6 +409,7 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
       await auth.api.signOut({ headers });
     },
     async changePassword(data, headers) {
+      requirePasswordSignIn();
       requireBrowserOrigin(headers, headersBrowserOrigin(headers, browserOrigin));
       const session = await sessions.read(headers);
       if (session === undefined) throw new Error("unauthenticated");
@@ -418,6 +435,17 @@ export function createAuthServer(options: AuthServerOptions): AuthServer {
     publicCredentials,
     close: () => Promise.resolve(),
   };
+
+  function requirePasswordSignIn(): void {
+    if (!passwordSignIn) throw new Error("password sign-in is disabled");
+  }
+
+  function handlePasswordless(request: Request, path: string): Promise<Response> {
+    const googleResponse = handleGoogle(request, path);
+    if (googleResponse !== undefined) return googleResponse;
+    if (!PASSWORDLESS_PRODUCT_PATHS.has(path)) return Promise.resolve(notFound());
+    return auth.handler(request);
+  }
 
   function handleGoogle(request: Request, path: string): Promise<Response> | undefined {
     if (path === GOOGLE_SIGN_IN_PATH && request.method === "POST") {
@@ -583,6 +611,10 @@ function rejectForeignOrigin(request: Request, browserOrigin: string): Response 
     // Invalid browser origins fail through the same public boundary as hostile origins.
   }
   return authBoundaryError("Invalid origin", "INVALID_ORIGIN");
+}
+
+function notFound(): Response {
+  return Response.json({ error: "not_found" }, { status: 404 });
 }
 
 function authBoundaryError(message: string, code: string): Response {

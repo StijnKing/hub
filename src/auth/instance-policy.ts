@@ -2,10 +2,12 @@ import { z } from "zod";
 
 export const REGISTRATION_MODES = ["open", "invite_only", "disabled"] as const;
 export const ORGANIZATION_CREATION_MODES = ["open", "disabled"] as const;
+export const PASSWORD_SIGN_IN_MODES = ["enabled", "disabled"] as const;
 export const PASSWORD_MIN_LENGTH = 12;
 
 export type RegistrationMode = (typeof REGISTRATION_MODES)[number];
 export type OrganizationCreationMode = (typeof ORGANIZATION_CREATION_MODES)[number];
+export type PasswordSignInMode = (typeof PASSWORD_SIGN_IN_MODES)[number];
 
 export interface BootstrapSettings {
   organizationName: string;
@@ -17,10 +19,13 @@ export interface InstanceAuthPolicy {
   registrationMode: RegistrationMode;
   organizationCreation: OrganizationCreationMode;
   bootstrap: BootstrapSettings | undefined;
+  /** Absent means `enabled`. `disabled` leaves Google as the only way to sign in. */
+  passwordSignIn?: PasswordSignInMode;
 }
 
 const registrationModeSchema = z.enum(REGISTRATION_MODES);
 const organizationCreationSchema = z.enum(ORGANIZATION_CREATION_MODES);
+const passwordSignInSchema = z.enum(PASSWORD_SIGN_IN_MODES);
 const bootstrapPasswordSchema = z
   .string()
   .min(PASSWORD_MIN_LENGTH, "PASEO_BOOTSTRAP_OWNER_PASSWORD must be at least 12 characters")
@@ -43,6 +48,7 @@ export function defaultInstanceAuthPolicy(): InstanceAuthPolicy {
     registrationMode: "invite_only",
     organizationCreation: "disabled",
     bootstrap: undefined,
+    passwordSignIn: "enabled",
   };
 }
 
@@ -63,6 +69,13 @@ export function readInstanceAuthPolicy(
     ORGANIZATION_CREATION_MODES,
     "disabled",
   );
+  const passwordSignIn = parsePolicyValue(
+    "PASEO_HUB_PASSWORD_SIGN_IN",
+    nonBlank(environment["PASEO_HUB_PASSWORD_SIGN_IN"]),
+    passwordSignInSchema,
+    PASSWORD_SIGN_IN_MODES,
+    "enabled",
+  );
   const organizationName = environment["PASEO_BOOTSTRAP_ORGANIZATION"]?.trim() ?? "";
   const ownerEmail = environment["PASEO_BOOTSTRAP_OWNER_EMAIL"]?.trim() ?? "";
   const ownerPassword = environment["PASEO_BOOTSTRAP_OWNER_PASSWORD"] ?? "";
@@ -70,20 +83,31 @@ export function readInstanceAuthPolicy(
     (value) => value.length > 0,
   ).length;
 
+  if (passwordSignIn === "disabled" && ownerPassword.length > 0) {
+    throw new Error(
+      "PASEO_BOOTSTRAP_OWNER_PASSWORD must be unset when PASEO_HUB_PASSWORD_SIGN_IN is disabled",
+    );
+  }
   if (suppliedBootstrapFields === 0) {
-    return { registrationMode, organizationCreation, bootstrap: undefined };
+    return { registrationMode, organizationCreation, bootstrap: undefined, passwordSignIn };
   }
   if (suppliedBootstrapFields === 2 && ownerPassword.length === 0) {
     validateBootstrapIdentity(organizationName, ownerEmail);
     return {
       registrationMode,
       organizationCreation,
+      passwordSignIn,
       bootstrap: {
         organizationName,
         ownerEmail: normalizeEmail(ownerEmail),
         ownerPassword: undefined,
       },
     };
+  }
+  if (passwordSignIn === "disabled") {
+    throw new Error(
+      "PASEO_BOOTSTRAP_ORGANIZATION and PASEO_BOOTSTRAP_OWNER_EMAIL must be supplied together",
+    );
   }
   if (suppliedBootstrapFields !== 3) {
     throw new Error(
@@ -100,6 +124,7 @@ export function readInstanceAuthPolicy(
   return {
     registrationMode,
     organizationCreation,
+    passwordSignIn,
     bootstrap: {
       organizationName,
       ownerEmail: normalizeEmail(ownerEmail),
@@ -126,6 +151,10 @@ function parsePolicyValue<T extends string>(
   const result = schema.safeParse(value ?? fallback);
   if (result.success) return result.data;
   throw new Error(`${name} must be one of: ${allowed.join(", ")}`);
+}
+
+function nonBlank(value: string | undefined): string | undefined {
+  return value === undefined || value.trim().length === 0 ? undefined : value.trim();
 }
 
 export function normalizeEmail(email: string): string {

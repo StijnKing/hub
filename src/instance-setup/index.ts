@@ -92,8 +92,11 @@ interface ExistingOrganization extends QueryRow {
 interface OperatorAccount {
   name: string;
   email: string;
-  /** Hashed before the transaction opens: hashing is slow and this runs under a table lock. */
-  passwordHash: string;
+  /**
+   * Hashed before the transaction opens: hashing is slow and this runs under a table lock.
+   * Undefined when password sign-in is disabled: the owner gets no credential to link Google to.
+   */
+  passwordHash: string | undefined;
   /** Environment bootstrap issues a temporary password; an interactively chosen one is final. */
   mustChangePassword: boolean;
 }
@@ -119,7 +122,14 @@ export class InstanceSetup {
   /** Creates the environment-configured owner. No-op when bootstrap is not configured. */
   async initializeFromPolicy(): Promise<void> {
     const settings = this.options.policy.bootstrap;
-    if (settings === undefined) return;
+    if (settings === undefined) {
+      if (this.passwordSignInDisabled() && (await this.status()) === "available") {
+        throw new InstanceBootstrapError(
+          "PASEO_BOOTSTRAP_ORGANIZATION and PASEO_BOOTSTRAP_OWNER_EMAIL are required to create the first owner when PASEO_HUB_PASSWORD_SIGN_IN is disabled",
+        );
+      }
+      return;
+    }
 
     // Resolve outside the transaction — the same value the create-organization path uses, so the
     // bootstrap owner's organization is stamped by the instance's provisioning policy too.
@@ -141,6 +151,7 @@ export class InstanceSetup {
           settings,
           row.organization_id,
           entitlement,
+          this.passwordSignInDisabled(),
         );
         await completeBootstrap(client, created.organizationId, created.ownerUserId);
       });
@@ -179,6 +190,7 @@ export class InstanceSetup {
    * of inserts and nothing else.
    */
   async claim(operator: InitialOperator): Promise<InstanceClaim> {
+    if (this.passwordSignInDisabled()) return { status: "unavailable" };
     const email = normalizeEmail(operator.email);
     const accountName = interactiveAccountName(email);
     const organizationName = INTERACTIVE_ORGANIZATION_NAME;
@@ -203,6 +215,10 @@ export class InstanceSetup {
       await completeBootstrap(client, organization.id, ownerUserId);
       return { status: "claimed" };
     });
+  }
+
+  private passwordSignInDisabled(): boolean {
+    return this.options.policy.passwordSignIn === "disabled";
   }
 }
 
@@ -293,6 +309,7 @@ async function createOperatorAccount(
      values ($1, $2, $3, true, $4, true)`,
     [ownerUserId, operator.name, operator.email, operator.mustChangePassword],
   );
+  if (operator.passwordHash === undefined) return ownerUserId;
   await client.query(
     `insert into account
        (id, account_id, provider_id, user_id, password)
@@ -307,6 +324,7 @@ async function createBootstrapData(
   settings: BootstrapSettings,
   existingOrganizationId: string | null,
   entitlement: ProvisioningEntitlement,
+  passwordSignInDisabled: boolean,
 ): Promise<{ organizationId: string; ownerUserId: string }> {
   const existingOwner = await client.query<{ id: string }>(
     `select id from "user" where lower(email) = $1 limit 1`,
@@ -323,7 +341,7 @@ async function createBootstrapData(
     settings,
     existingOrganizationId,
   );
-  if (settings.ownerPassword === undefined) {
+  if (settings.ownerPassword === undefined && !passwordSignInDisabled) {
     throw new InstanceBootstrapError(
       "PASEO_BOOTSTRAP_OWNER_PASSWORD is required until instance bootstrap completes",
     );
@@ -332,8 +350,9 @@ async function createBootstrapData(
   const ownerUserId = await createOperatorAccount(client, {
     name: settings.ownerEmail.split("@")[0] ?? settings.ownerEmail,
     email: settings.ownerEmail,
-    passwordHash: await hashPassword(settings.ownerPassword),
-    mustChangePassword: true,
+    passwordHash:
+      settings.ownerPassword === undefined ? undefined : await hashPassword(settings.ownerPassword),
+    mustChangePassword: settings.ownerPassword !== undefined,
   });
 
   if (existingOrganization === undefined) {

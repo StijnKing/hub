@@ -236,26 +236,7 @@ export class OrganizationAccess {
   private async state(request: Request): Promise<Response> {
     const session = await this.options.sessions.read(request.headers);
     const invitationId = new URL(request.url).searchParams.get("invitation");
-    if (session === undefined) {
-      // A pristine instance has no accounts to sign in to and no invitations to carry, so the
-      // first-run journey replaces the sign-in wall entirely until someone claims it.
-      if ((await this.options.instanceSetup.status()) === "available") {
-        return Response.json({ status: "instanceSetupRequired" });
-      }
-      const invitation =
-        invitationId === null
-          ? undefined
-          : await this.signedOutInvitation(this.options.pool, invitationId);
-      return Response.json({
-        status: "signedOut",
-        registration: this.options.policy.registrationMode,
-        ...(this.options.googleSignIn === true ? { googleSignIn: true } : {}),
-        ...(invitation === undefined ? {} : { invitation: invitationSummary(invitation, true) }),
-        ...(invitationId !== null && invitation === undefined
-          ? { invitationUnavailable: true }
-          : {}),
-      });
-    }
+    if (session === undefined) return this.signedOutState(invitationId);
     const account = { id: session.userId, name: session.name, email: session.email };
     if (session.mustChangePassword) {
       return Response.json({ status: "passwordChangeRequired", account });
@@ -305,6 +286,27 @@ export class OrganizationAccess {
       canCreateOrganization: this.options.policy.organizationCreation === "open",
       team,
       ...(invitation === undefined ? {} : { invitation: invitationSummary(invitation) }),
+      ...(invitationId !== null && invitation === undefined ? { invitationUnavailable: true } : {}),
+    });
+  }
+
+  private async signedOutState(invitationId: string | null): Promise<Response> {
+    const passwordSignIn = this.options.policy.passwordSignIn !== "disabled";
+    // A pristine instance has no accounts to sign in to and no invitations to carry, so the
+    // first-run journey replaces the sign-in wall entirely until someone claims it.
+    if (passwordSignIn && (await this.options.instanceSetup.status()) === "available") {
+      return Response.json({ status: "instanceSetupRequired" });
+    }
+    const invitation =
+      invitationId === null
+        ? undefined
+        : await this.signedOutInvitation(this.options.pool, invitationId);
+    return Response.json({
+      status: "signedOut",
+      registration: this.options.policy.registrationMode,
+      ...(this.options.googleSignIn === true ? { googleSignIn: true } : {}),
+      ...(passwordSignIn ? {} : { passwordSignInDisabled: true }),
+      ...(invitation === undefined ? {} : { invitation: invitationSummary(invitation, true) }),
       ...(invitationId !== null && invitation === undefined ? { invitationUnavailable: true } : {}),
     });
   }
